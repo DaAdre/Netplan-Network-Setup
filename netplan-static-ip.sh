@@ -246,12 +246,12 @@ select_interface() {
   )
 
   if [[ "${#interfaces[@]}" -eq 0 ]]; then
-    error "Keine Netzwerkinterfaces gefunden."
+    error "Keine Netzwerkinterfaces gefunden." >&2
     exit 1
   fi
 
-  echo "Verfügbare Netzwerkinterfaces:"
-  echo
+  echo "Verfügbare Netzwerkinterfaces:" >&2
+  echo >&2
 
   for i in "${!interfaces[@]}"; do
     local iface="${interfaces[$i]}"
@@ -260,10 +260,10 @@ select_interface() {
     current_ip="$(ip -4 -o addr show "$iface" | awk '{print $4}' | paste -sd ', ' -)"
     [[ -z "$current_ip" ]] && current_ip="keine IPv4"
 
-    echo "  [$((i + 1))] $iface ($current_ip)"
+    echo "  [$((i + 1))] $iface ($current_ip)" >&2
   done
 
-  echo
+  echo >&2
 
   local choice=""
 
@@ -275,7 +275,7 @@ select_interface() {
       return
     fi
 
-    error "Ungültige Auswahl."
+    error "Ungültige Auswahl." >&2
   done
 }
 
