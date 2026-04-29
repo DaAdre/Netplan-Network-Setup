@@ -2,10 +2,8 @@
 
 set -Eeuo pipefail
 
-SCRIPT_NAME="Netplan Static IP Setup"
-NETPLAN_DIR="/etc/netplan"
-BACKUP_DIR="${NETPLAN_DIR}/backup-$(date +%Y%m%d-%H%M%S)"
-CLOUD_INIT_DISABLE_FILE="/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+SCRIPT_NAME="Linux IP Changer"
+BACKUP_BASE="/root/ip-changer-backup-$(date +%Y%m%d-%H%M%S)"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -18,6 +16,20 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARNUNG]${NC} $1"; }
 error() { echo -e "${RED}[FEHLER]${NC} $1"; }
 
+tty_read() {
+  local prompt="$1"
+  local var_name="$2"
+
+  if [[ -r /dev/tty ]]; then
+    read -rp "$prompt" "$var_name" < /dev/tty
+  else
+    error "Keine interaktive Eingabe möglich."
+    error "Bitte Script nicht mit curl | bash starten."
+    error "Nutze z.B.: sudo bash <(curl -fsSL URL)"
+    exit 1
+  fi
+}
+
 print_header() {
   clear || true
   echo -e "${BLUE}=================================================${NC}"
@@ -25,28 +37,37 @@ print_header() {
   echo -e "${BLUE}=================================================${NC}"
   echo
   echo "Beispiel:"
-  echo "  IP-Adresse: 10.22.38.11"
-  echo "  CIDR:       18"
-  echo "  Gateway:    10.22.0.1"
-  echo "  DNS:        9.9.9.9,8.8.8.8"
+  echo "  IP-Adresse: 192.168.10.25"
+  echo "  CIDR:       wird automatisch vorgeschlagen"
+  echo "  Gateway:    wird automatisch vorgeschlagen"
+  echo "  DNS:        wird automatisch vorgeschlagen"
   echo
 }
 
 require_root() {
   if [[ "$EUID" -ne 0 ]]; then
     error "Bitte als root ausführen."
-    echo
-    echo "Beispiel:"
-    echo "  curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/netplan-static-ip.sh | sudo bash"
     exit 1
+  fi
+}
+
+detect_network_stack() {
+  if command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
+    echo "netplan"
+  elif [[ -f /etc/network/interfaces ]]; then
+    echo "ifupdown"
+  else
+    echo "unknown"
   fi
 }
 
 validate_ipv4() {
   local ip="$1"
+
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
 
   IFS='.' read -r a b c d <<< "$ip"
+
   for octet in "$a" "$b" "$c" "$d"; do
     [[ "$octet" =~ ^[0-9]+$ ]] || return 1
     (( octet >= 0 && octet <= 255 )) || return 1
@@ -73,11 +94,17 @@ int_to_ip() {
 
 cidr_to_mask_int() {
   local cidr="$1"
+
   if (( cidr == 0 )); then
     echo 0
   else
     echo $(( 0xFFFFFFFF << (32 - cidr) & 0xFFFFFFFF ))
   fi
+}
+
+cidr_to_netmask() {
+  local cidr="$1"
+  int_to_ip "$(cidr_to_mask_int "$cidr")"
 }
 
 calculate_network_info() {
@@ -125,38 +152,71 @@ ask_ipv4() {
   local value=""
 
   while true; do
-    read -rp "$prompt" value
+    tty_read "$prompt" value
 
     if validate_ipv4 "$value"; then
       echo "$value"
       return
     fi
 
-    error "Ungültige IPv4-Adresse: $value" >&2
+    error "Ungültige IPv4-Adresse: $value"
   done
 }
 
-ask_cidr() {
+ask_cidr_with_default() {
+  local default_cidr="$1"
   local value=""
 
   while true; do
-    read -rp "CIDR eingeben, z.B. 18 oder 24: " value
+    if [[ -n "$default_cidr" ]]; then
+      tty_read "CIDR eingeben [${default_cidr}]: " value
+      value="${value:-$default_cidr}"
+    else
+      tty_read "CIDR eingeben, z.B. 24: " value
+    fi
 
     if validate_cidr "$value"; then
       echo "$value"
       return
     fi
 
-    error "Ungültiger CIDR-Wert. Erlaubt ist 1 bis 32." >&2
+    error "Ungültiger CIDR-Wert. Erlaubt ist 1 bis 32."
   done
 }
 
-ask_dns() {
+ask_gateway_with_default() {
+  local default_gateway="$1"
+  local value=""
+
+  while true; do
+    if [[ -n "$default_gateway" ]]; then
+      tty_read "Gateway eingeben [${default_gateway}]: " value
+      value="${value:-$default_gateway}"
+    else
+      tty_read "Gateway eingeben, z.B. 192.168.10.1: " value
+    fi
+
+    if validate_ipv4 "$value"; then
+      echo "$value"
+      return
+    fi
+
+    error "Ungültiges Gateway: $value"
+  done
+}
+
+ask_dns_with_default() {
+  local default_dns="$1"
   local input=""
   local valid dns
 
   while true; do
-    read -rp "DNS-Server kommagetrennt eingeben, z.B. 9.9.9.9,8.8.8.8: " input
+    if [[ -n "$default_dns" ]]; then
+      tty_read "DNS-Server kommagetrennt eingeben [${default_dns}]: " input
+      input="${input:-$default_dns}"
+    else
+      tty_read "DNS-Server kommagetrennt eingeben, z.B. 9.9.9.9,8.8.8.8: " input
+    fi
 
     valid=1
     IFS=',' read -ra dns_servers <<< "$input"
@@ -165,7 +225,7 @@ ask_dns() {
       dns="$(echo "$dns" | xargs)"
 
       if ! validate_ipv4 "$dns"; then
-        error "Ungültiger DNS-Server: $dns" >&2
+        error "Ungültiger DNS-Server: $dns"
         valid=0
       fi
     done
@@ -186,12 +246,12 @@ select_interface() {
   )
 
   if [[ "${#interfaces[@]}" -eq 0 ]]; then
-    error "Keine Netzwerkinterfaces gefunden." >&2
+    error "Keine Netzwerkinterfaces gefunden."
     exit 1
   fi
 
-  echo "Verfügbare Netzwerkinterfaces:" >&2
-  echo >&2
+  echo "Verfügbare Netzwerkinterfaces:"
+  echo
 
   for i in "${!interfaces[@]}"; do
     local iface="${interfaces[$i]}"
@@ -200,27 +260,54 @@ select_interface() {
     current_ip="$(ip -4 -o addr show "$iface" | awk '{print $4}' | paste -sd ', ' -)"
     [[ -z "$current_ip" ]] && current_ip="keine IPv4"
 
-    echo "  [$((i + 1))] $iface ($current_ip)" >&2
+    echo "  [$((i + 1))] $iface ($current_ip)"
   done
 
-  echo >&2
+  echo
 
   local choice=""
 
   while true; do
-    read -rp "Interface auswählen [1-${#interfaces[@]}]: " choice
+    tty_read "Interface auswählen [1-${#interfaces[@]}]: " choice
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#interfaces[@]} )); then
       echo "${interfaces[$((choice - 1))]}"
       return
     fi
 
-    error "Ungültige Auswahl." >&2
+    error "Ungültige Auswahl."
   done
+}
+
+detect_current_cidr() {
+  local iface="$1"
+
+  ip -4 -o addr show "$iface" |
+    awk '{print $4}' |
+    head -n1 |
+    cut -d'/' -f2
 }
 
 detect_gateway() {
   ip route | awk '/default/ {print $3; exit}'
+}
+
+detect_dns() {
+  local dns_list=""
+
+  if [[ -f /etc/resolv.conf ]]; then
+    dns_list="$(
+      awk '/^nameserver/ {print $2}' /etc/resolv.conf |
+        grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' |
+        paste -sd ',' -
+    )"
+  fi
+
+  if [[ -z "$dns_list" || "$dns_list" == "127.0.0.53" ]]; then
+    dns_list="9.9.9.9,8.8.8.8"
+  fi
+
+  echo "$dns_list"
 }
 
 show_current_config() {
@@ -235,37 +322,53 @@ show_current_config() {
   echo "----------------------------------------"
 }
 
-backup_netplan() {
-  info "Erstelle Backup der bestehenden Netplan-Konfigurationen..."
+backup_file() {
+  local file="$1"
 
-  mkdir -p "$BACKUP_DIR"
-
-  if compgen -G "${NETPLAN_DIR}/*.yaml" >/dev/null; then
-    cp "${NETPLAN_DIR}"/*.yaml "$BACKUP_DIR"/
-    success "Backup erstellt: $BACKUP_DIR"
-  else
-    warn "Keine bestehenden YAML-Dateien in ${NETPLAN_DIR} gefunden."
+  if [[ -e "$file" ]]; then
+    mkdir -p "$BACKUP_BASE"
+    cp -a "$file" "$BACKUP_BASE/"
+    success "Backup erstellt: $BACKUP_BASE/$(basename "$file")"
   fi
 }
 
-disable_existing_netplan_files() {
-  info "Deaktiviere bestehende Netplan-Dateien..."
+write_resolv_conf() {
+  local dns_input="$1"
 
-  shopt -s nullglob
+  info "Setze DNS in /etc/resolv.conf..."
 
-  for file in "${NETPLAN_DIR}"/*.yaml; do
-    mv "$file" "${file}.disabled"
-    info "Deaktiviert: $file"
-  done
+  if systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
+    systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+  fi
 
-  shopt -u nullglob
+  backup_file "/etc/resolv.conf"
+  rm -f /etc/resolv.conf
+
+  {
+    echo "# Generated by Linux IP Changer"
+    IFS=',' read -ra dns_servers <<< "$dns_input"
+
+    for dns in "${dns_servers[@]}"; do
+      dns="$(echo "$dns" | xargs)"
+      echo "nameserver ${dns}"
+    done
+  } > /etc/resolv.conf
+
+  chmod 644 /etc/resolv.conf
+
+  success "/etc/resolv.conf wurde gesetzt."
 }
 
 disable_cloud_init_networking() {
+  local cloud_file="/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+
   if [[ -d /etc/cloud/cloud.cfg.d ]]; then
     info "Deaktiviere Cloud-Init Netzwerkverwaltung..."
 
-    cat > "$CLOUD_INIT_DISABLE_FILE" <<EOF
+    mkdir -p "$BACKUP_BASE/cloud"
+    [[ -f "$cloud_file" ]] && cp -a "$cloud_file" "$BACKUP_BASE/cloud/"
+
+    cat > "$cloud_file" <<EOF
 network: {config: disabled}
 EOF
 
@@ -273,16 +376,31 @@ EOF
   fi
 }
 
-write_netplan_config() {
+configure_netplan() {
   local iface="$1"
   local ipaddr="$2"
   local cidr="$3"
   local gateway="$4"
   local dns_input="$5"
-  local netplan_file="${NETPLAN_DIR}/99-static-${iface}.yaml"
 
+  local netplan_dir="/etc/netplan"
+  local netplan_file="${netplan_dir}/99-static-${iface}.yaml"
   local dns_yaml=""
   local dns
+
+  mkdir -p "$BACKUP_BASE/netplan"
+
+  if compgen -G "${netplan_dir}/*.yaml" >/dev/null; then
+    cp -a "${netplan_dir}"/*.yaml "$BACKUP_BASE/netplan/"
+    success "Netplan-Backup erstellt: $BACKUP_BASE/netplan/"
+  fi
+
+  shopt -s nullglob
+  for file in "${netplan_dir}"/*.yaml; do
+    mv "$file" "${file}.disabled"
+    info "Alte Netplan-Datei deaktiviert: $file"
+  done
+  shopt -u nullglob
 
   IFS=',' read -ra dns_servers <<< "$dns_input"
 
@@ -291,7 +409,7 @@ write_netplan_config() {
     dns_yaml+="          - ${dns}"$'\n'
   done
 
-  info "Schreibe neue Netplan-Konfiguration: $netplan_file"
+  info "Schreibe Netplan-Konfiguration: $netplan_file"
 
   cat > "$netplan_file" <<EOF
 network:
@@ -313,65 +431,61 @@ EOF
 
   chmod 600 "$netplan_file"
 
-  success "Netplan-Datei erstellt: $netplan_file"
+  netplan generate
+  netplan apply
+
+  success "Netplan-Konfiguration wurde angewendet."
 }
 
-write_resolv_conf() {
-  local dns_input="$1"
-
-  info "Setze DNS zusätzlich direkt in /etc/resolv.conf..."
-
-  if systemctl list-unit-files systemd-resolved.service >/dev/null 2>&1; then
-    systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
-    success "systemd-resolved wurde deaktiviert."
-  fi
-
-  rm -f /etc/resolv.conf
-
-  {
-    echo "# Generated by Netplan Static IP Setup"
-    IFS=',' read -ra dns_servers <<< "$dns_input"
-
-    for dns in "${dns_servers[@]}"; do
-      dns="$(echo "$dns" | xargs)"
-      echo "nameserver ${dns}"
-    done
-  } > /etc/resolv.conf
-
-  chmod 644 /etc/resolv.conf
-
-  success "/etc/resolv.conf wurde gesetzt."
-}
-
-flush_old_addresses() {
+configure_ifupdown() {
   local iface="$1"
   local ipaddr="$2"
   local cidr="$3"
+  local gateway="$4"
+  local dns_input="$5"
 
-  warn "Entferne vorhandene IPv4-Adressen von $iface..."
+  local interfaces_file="/etc/network/interfaces"
+  local netmask
+  local dns_space=""
+
+  netmask="$(cidr_to_netmask "$cidr")"
+
+  IFS=',' read -ra dns_servers <<< "$dns_input"
+  for dns in "${dns_servers[@]}"; do
+    dns="$(echo "$dns" | xargs)"
+    dns_space+="${dns} "
+  done
+
+  backup_file "$interfaces_file"
+
+  info "Schreibe ifupdown-Konfiguration: $interfaces_file"
+
+  cat > "$interfaces_file" <<EOF
+# Generated by Linux IP Changer
+
+auto lo
+iface lo inet loopback
+
+auto ${iface}
+iface ${iface} inet static
+    address ${ipaddr}
+    netmask ${netmask}
+    gateway ${gateway}
+    dns-nameservers ${dns_space}
+EOF
+
   ip -4 addr flush dev "$iface" || true
-
-  info "Setze neue IPv4-Adresse sofort manuell..."
   ip addr add "${ipaddr}/${cidr}" dev "$iface" || true
+  ip route replace default via "$gateway" dev "$iface" || true
 
-  success "IPv4-Adresse wurde direkt gesetzt."
-}
-
-apply_netplan() {
-  info "Prüfe Netplan-Konfiguration..."
-  netplan generate
-
-  success "Netplan-Konfiguration ist gültig."
-
-  info "Wende Netplan-Konfiguration an..."
-  netplan apply
-
-  if systemctl is-active --quiet systemd-networkd; then
-    info "Starte systemd-networkd neu..."
-    systemctl restart systemd-networkd
+  if systemctl list-unit-files networking.service >/dev/null 2>&1; then
+    systemctl restart networking || true
+  else
+    ifdown "$iface" || true
+    ifup "$iface" || true
   fi
 
-  success "Netplan wurde angewendet."
+  success "ifupdown-Konfiguration wurde gesetzt."
 }
 
 test_connectivity() {
@@ -406,28 +520,36 @@ main() {
   print_header
   require_root
 
-  local iface ipaddr cidr gateway dns_input detected_gateway
+  local stack iface ipaddr cidr gateway dns_input detected_gateway detected_cidr detected_dns confirm force
+
+  stack="$(detect_network_stack)"
+
+  case "$stack" in
+    netplan)
+      success "Netzwerk-Stack erkannt: Netplan"
+      ;;
+    ifupdown)
+      success "Netzwerk-Stack erkannt: ifupdown (/etc/network/interfaces)"
+      ;;
+    *)
+      error "Kein unterstützter Netzwerk-Stack erkannt."
+      error "Unterstützt: Netplan, ifupdown"
+      exit 1
+      ;;
+  esac
+
+  echo
 
   iface="$(select_interface)"
-
   show_current_config "$iface"
 
-  ipaddr="$(ask_ipv4 "Gewünschte statische IP-Adresse eingeben, z.B. 10.22.38.11: ")"
-  cidr="$(ask_cidr)"
-
+  detected_cidr="$(detect_current_cidr "$iface")"
   detected_gateway="$(detect_gateway)"
+  detected_dns="$(detect_dns)"
 
-  if [[ -n "$detected_gateway" ]]; then
-    read -rp "Gateway eingeben [${detected_gateway}]: " gateway
-    gateway="${gateway:-$detected_gateway}"
-  else
-    gateway="$(ask_ipv4 "Gateway eingeben, z.B. 10.22.0.1: ")"
-  fi
-
-  if ! validate_ipv4 "$gateway"; then
-    error "Ungültiges Gateway: $gateway"
-    exit 1
-  fi
+  ipaddr="$(ask_ipv4 "Gewünschte statische IP-Adresse eingeben, z.B. 192.168.10.25: ")"
+  cidr="$(ask_cidr_with_default "$detected_cidr")"
+  gateway="$(ask_gateway_with_default "$detected_gateway")"
 
   echo
   echo -e "${BLUE}Subnetz-Rechner:${NC}"
@@ -445,11 +567,7 @@ main() {
     echo "  IP:      ${ipaddr}/${cidr}"
     echo "  Gateway: ${gateway}"
     echo
-    echo "Beispiel:"
-    echo "  Bei IP 10.22.38.11 und Gateway 10.22.0.1 ist meistens /18 korrekt."
-    echo "  Bei /25 müsste das Gateway z.B. 10.22.38.1 sein."
-    echo
-    read -rp "Trotzdem fortfahren? [j/N]: " force
+    tty_read "Trotzdem fortfahren? [j/N]: " force
 
     if [[ ! "$force" =~ ^[jJ]$ ]]; then
       warn "Abgebrochen."
@@ -457,43 +575,54 @@ main() {
     fi
   fi
 
-  dns_input="$(ask_dns)"
+  dns_input="$(ask_dns_with_default "$detected_dns")"
 
   echo
   echo -e "${BLUE}Geplante Konfiguration:${NC}"
   echo "----------------------------------------"
+  echo "Stack:      $stack"
   echo "Interface:  $iface"
   echo "IP-Adresse: ${ipaddr}/${cidr}"
+  echo "Netmask:    $(cidr_to_netmask "$cidr")"
   echo "Gateway:    $gateway"
   echo "DNS:        $dns_input"
+  echo "Backup:     $BACKUP_BASE"
   echo "----------------------------------------"
   echo
 
-  read -rp "Konfiguration schreiben und anwenden? [j/N]: " confirm
+  tty_read "Konfiguration schreiben und anwenden? [j/N]: " confirm
 
   if [[ ! "$confirm" =~ ^[jJ]$ ]]; then
     warn "Abgebrochen."
     exit 0
   fi
 
-  backup_netplan
-  disable_existing_netplan_files
   disable_cloud_init_networking
-  write_netplan_config "$iface" "$ipaddr" "$cidr" "$gateway" "$dns_input"
   write_resolv_conf "$dns_input"
-  flush_old_addresses "$iface" "$ipaddr" "$cidr"
-  apply_netplan
+
+  case "$stack" in
+    netplan)
+      configure_netplan "$iface" "$ipaddr" "$cidr" "$gateway" "$dns_input"
+      ;;
+    ifupdown)
+      configure_ifupdown "$iface" "$ipaddr" "$cidr" "$gateway" "$dns_input"
+      ;;
+  esac
+
   write_resolv_conf "$dns_input"
 
   echo
-  success "Fertig. Die Netzwerkkonfiguration wurde angewendet."
+  success "Fertig. Die Netzwerkkonfiguration wurde gesetzt."
   echo
+
   echo "Aktuelle IPv4-Konfiguration:"
   ip -4 addr show "$iface"
   echo
+
   echo "Aktuelle Route:"
   ip route
   echo
+
   echo "Aktuelle DNS-Konfiguration:"
   cat /etc/resolv.conf
   echo
