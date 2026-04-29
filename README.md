@@ -22,4 +22,4 @@ Ein interaktives Bash-Script zur schnellen Umstellung eines Linux-Servers von DH
 ### Direkt ausführen (empfohlen)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DaAdre/Netplan-Network-Setup/refs/heads/main/netplan-static-ip.sh | sudo bash
+bash <(curl -fsSL https://raw.githubusercontent.com/DaAdre/Netplan-Network-Setup/refs/heads/main/netplan-static-ip.sh)
