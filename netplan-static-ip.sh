@@ -51,7 +51,9 @@ require_root() {
 }
 
 detect_network_stack() {
-  if command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
+  if command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager; then
+    echo "networkmanager"
+  elif command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
     echo "netplan"
   elif [[ -f /etc/network/interfaces ]]; then
     echo "ifupdown"
@@ -378,6 +380,47 @@ EOF
   fi
 }
 
+configure_networkmanager() {
+  local iface="$1"
+  local ipaddr="$2"
+  local cidr="$3"
+  local gateway="$4"
+  local dns_input="$5"
+
+  local connection_name
+  local dns_space
+
+  connection_name="$(nmcli -t -f NAME,DEVICE con show --active | awk -F: -v dev="$iface" '$2 == dev {print $1; exit}')"
+
+  if [[ -z "$connection_name" ]]; then
+    connection_name="$iface"
+    warn "Keine aktive NetworkManager-Verbindung gefunden. Verwende: $connection_name"
+  fi
+
+  dns_space="$(echo "$dns_input" | tr ',' ' ')"
+
+  mkdir -p "$BACKUP_BASE/networkmanager"
+
+  nmcli con show "$connection_name" > "$BACKUP_BASE/networkmanager/${connection_name}.before.txt" 2>/dev/null || true
+
+  info "Konfiguriere NetworkManager-Verbindung: $connection_name"
+
+  nmcli con mod "$connection_name" \
+    ipv4.addresses "${ipaddr}/${cidr}" \
+    ipv4.gateway "$gateway" \
+    ipv4.dns "$dns_space" \
+    ipv4.method manual \
+    ipv6.method disabled \
+    connection.autoconnect yes
+
+  info "Aktiviere Verbindung neu..."
+
+  nmcli con down "$connection_name" || true
+  nmcli con up "$connection_name"
+
+  success "NetworkManager-Konfiguration wurde angewendet."
+}
+
 configure_netplan() {
   local iface="$1"
   local ipaddr="$2"
@@ -528,6 +571,9 @@ main() {
   stack="$(detect_network_stack)"
 
   case "$stack" in
+    networkmanager)
+      success "Netzwerk-Stack erkannt: NetworkManager"
+      ;;
     netplan)
       success "Netzwerk-Stack erkannt: Netplan"
       ;;
@@ -536,7 +582,7 @@ main() {
       ;;
     *)
       error "Kein unterstützter Netzwerk-Stack erkannt."
-      error "Unterstützt: Netplan, ifupdown"
+      error "Unterstützt: NetworkManager, Netplan, ifupdown"
       exit 1
       ;;
   esac
@@ -544,7 +590,6 @@ main() {
   echo
 
   iface="$(select_interface)"
-
   show_current_config "$iface"
 
   detected_cidr="$(detect_current_cidr "$iface")"
@@ -605,6 +650,9 @@ main() {
   write_resolv_conf "$dns_input"
 
   case "$stack" in
+    networkmanager)
+      configure_networkmanager "$iface" "$ipaddr" "$cidr" "$gateway" "$dns_input"
+      ;;
     netplan)
       configure_netplan "$iface" "$ipaddr" "$cidr" "$gateway" "$dns_input"
       ;;
