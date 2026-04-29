@@ -24,7 +24,6 @@ tty_read() {
     read -rp "$prompt" "$var_name" < /dev/tty
   else
     error "Keine interaktive Eingabe möglich."
-    error "Bitte Script nicht mit curl | bash starten."
     error "Nutze z.B.: sudo bash <(curl -fsSL URL)"
     exit 1
   fi
@@ -72,6 +71,8 @@ validate_ipv4() {
     [[ "$octet" =~ ^[0-9]+$ ]] || return 1
     (( octet >= 0 && octet <= 255 )) || return 1
   done
+
+  return 0
 }
 
 validate_cidr() {
@@ -159,7 +160,7 @@ ask_ipv4() {
       return
     fi
 
-    error "Ungültige IPv4-Adresse: $value"
+    error "Ungültige IPv4-Adresse: $value" >&2
   done
 }
 
@@ -180,7 +181,7 @@ ask_cidr_with_default() {
       return
     fi
 
-    error "Ungültiger CIDR-Wert. Erlaubt ist 1 bis 32."
+    error "Ungültiger CIDR-Wert. Erlaubt ist 1 bis 32." >&2
   done
 }
 
@@ -201,7 +202,7 @@ ask_gateway_with_default() {
       return
     fi
 
-    error "Ungültiges Gateway: $value"
+    error "Ungültiges Gateway: $value" >&2
   done
 }
 
@@ -225,7 +226,7 @@ ask_dns_with_default() {
       dns="$(echo "$dns" | xargs)"
 
       if ! validate_ipv4 "$dns"; then
-        error "Ungültiger DNS-Server: $dns"
+        error "Ungültiger DNS-Server: $dns" >&2
         valid=0
       fi
     done
@@ -250,20 +251,19 @@ select_interface() {
     exit 1
   fi
 
-  echo "Verfügbare Netzwerkinterfaces:" >&2
-  echo >&2
+  printf "Verfügbare Netzwerkinterfaces:\n\n" >&2
 
   for i in "${!interfaces[@]}"; do
     local iface="${interfaces[$i]}"
     local current_ip
 
-    current_ip="$(ip -4 -o addr show "$iface" | awk '{print $4}' | paste -sd ', ' -)"
+    current_ip="$(ip -4 -o addr show "$iface" | awk '{print $4}' | paste -sd ',' -)"
     [[ -z "$current_ip" ]] && current_ip="keine IPv4"
 
-    echo "  [$((i + 1))] $iface ($current_ip)" >&2
+    printf "  [%s] %s (%s)\n" "$((i + 1))" "$iface" "$current_ip" >&2
   done
 
-  echo >&2
+  printf "\n" >&2
 
   local choice=""
 
@@ -271,8 +271,8 @@ select_interface() {
     tty_read "Interface auswählen [1-${#interfaces[@]}]: " choice
 
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#interfaces[@]} )); then
-      echo "${interfaces[$((choice - 1))]}"
-      return
+      printf "%s\n" "${interfaces[$((choice - 1))]}"
+      return 0
     fi
 
     error "Ungültige Auswahl." >&2
@@ -299,11 +299,12 @@ detect_dns() {
     dns_list="$(
       awk '/^nameserver/ {print $2}' /etc/resolv.conf |
         grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' |
+        grep -v '^127\.0\.0\.53$' |
         paste -sd ',' -
     )"
   fi
 
-  if [[ -z "$dns_list" || "$dns_list" == "127.0.0.53" ]]; then
+  if [[ -z "$dns_list" ]]; then
     dns_list="9.9.9.9,8.8.8.8"
   fi
 
@@ -342,6 +343,7 @@ write_resolv_conf() {
   fi
 
   backup_file "/etc/resolv.conf"
+
   rm -f /etc/resolv.conf
 
   {
@@ -451,6 +453,7 @@ configure_ifupdown() {
   netmask="$(cidr_to_netmask "$cidr")"
 
   IFS=',' read -ra dns_servers <<< "$dns_input"
+
   for dns in "${dns_servers[@]}"; do
     dns="$(echo "$dns" | xargs)"
     dns_space+="${dns} "
@@ -541,6 +544,7 @@ main() {
   echo
 
   iface="$(select_interface)"
+
   show_current_config "$iface"
 
   detected_cidr="$(detect_current_cidr "$iface")"
